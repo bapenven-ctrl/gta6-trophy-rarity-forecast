@@ -29,7 +29,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-KIT_INPUT = Path.home() / "workspace/makefun/gta6-trophy-rarity-forecast-01-kit/kit/input"
+KIT_INPUT = Path.home() / "workspace/makefun/gta6-trophy-rarity-forecast-01-kit-fresh/gta6-trophy-rarity-forecast-01-kit/input"
+THURSDAY_MAIN = Path("/tmp/thursday_main.py")
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z_HOUSE = [-1.645, -0.674, 0.0, 0.674, 1.645]
@@ -153,7 +154,19 @@ def fc_candidate(case):
     return {row["id"]: row["q"] for row in fc["trophies"]}
 
 
-FORECASTERS = {"candidate": fc_candidate, "persistence": fc_persistence, "house_curve": fc_house_curve}
+thursday_spec = importlib.util.spec_from_file_location("thursday", THURSDAY_MAIN)
+thursday_mod = importlib.util.module_from_spec(thursday_spec)
+thursday_spec.loader.exec_module(thursday_mod)
+
+
+def fc_thursday(case):
+    """The submitted Thursday model (git HEAD), scored on the same cases."""
+    fc = thursday_mod.forecast_case(case)
+    return {row["id"]: row["q"] for row in fc["trophies"]}
+
+
+FORECASTERS = {"candidate": fc_candidate, "thursday": fc_thursday,
+               "persistence": fc_persistence, "house_curve": fc_house_curve}
 
 
 def load_case(cid):
@@ -277,13 +290,97 @@ def simulate_scenario(rng, base_rates, p_max, tau_p, delta):
     return case, truth
 
 
+def simulate_refresh_process(rng, base_rates, jump_scale, cadence_h, delta, big_jump, p_max):
+    """Simulate a final-like case whose pool moves in discrete refresh
+    jumps. Per-refresh pool multipliers are lognormal with a median that
+    declines over the case (early refreshes are the big ones -- the one
+    documented launch-night refresh multiplied the pool several-fold,
+    later refreshes are small), capped so the pool saturates at p_max;
+    earners grow along saturating curves and are diluted discretely at
+    each refresh. One family also carries a single big mid-case jump.
+    Truth is the page state at the target (the last refresh at or
+    before it), as in simulate_scenario."""
+    t0 = datetime(2026, 11, 18, 23, 50, tzinfo=timezone.utc)
+    checkpoint_h = 60.0
+    horizon_h = 6510.0 / 60.0
+    dt = 0.25
+    steps = int((checkpoint_h + horizon_h) / dt)
+    n = len(base_rates)
+    ceilings = []
+    rates_k = []
+    for r in base_rates:
+        s0 = (r if r is not None else 0.05) / 100.0
+        mult = rng.choice([1.5, 3.0, 8.0])
+        ceilings.append(min(0.98, max(s0, s0 * mult)))
+        rates_k.append(1.0 / rng.choice([18.0, 48.0, 120.0]))
+    s = [(r if r is not None else 0.05) / 100.0 for r in base_rates]
+    p = 638.0
+    page_rates = list(base_rates)
+    page_players = 638
+    next_refresh = rng.uniform(2.0, cadence_h)
+    big_at = rng.uniform(20.0, checkpoint_h + horizon_h - 10.0) if big_jump else None
+    big_done = False
+    history = []
+    truth = None
+    for step in range(steps + 1):
+        t = step * dt
+        for i in range(n):
+            s[i] += rates_k[i] * (ceilings[i] - s[i]) * dt
+            s[i] = min(max(s[i], 0.0), 0.9999)
+        if t >= next_refresh:
+            frac = t / (checkpoint_h + horizon_h)
+            med = (3.0 * jump_scale) * ((1.15 / (3.0 * jump_scale)) ** frac)
+            j = math.exp(rng.gauss(math.log(med), 0.35))
+            j = min(max(j, 1.02), 20.0)
+            if big_at is not None and not big_done and t >= big_at:
+                j = min(max(math.exp(rng.gauss(math.log(5.0), 0.4)), 1.5), 20.0)
+                big_done = True
+            j = min(j, max(1.02, p_max / p))  # pool saturates at p_max
+            p_new = p * j
+            for i in range(n):
+                s[i] = s[i] * (p + delta * (p_new - p)) / p_new
+            p = p_new
+            page_rates = [round(100.0 * v, 2) for v in s]
+            page_players = int(round(p))
+            next_refresh = t + rng.uniform(0.5 * cadence_h, 1.5 * cadence_h)
+        if step % 2 == 0 and t <= checkpoint_h:  # a read every 30 min
+            slot = t0 + timedelta(hours=t)
+            history.append({
+                "slot": iso(slot.timestamp()),
+                "at": iso(slot.timestamp()),
+                "players_tracked": page_players,
+                "trophies_earned": int(round(sum(v for v in page_rates if v) * page_players / 100.0)),
+                "rates": list(page_rates),
+            })
+        if abs(t - (checkpoint_h + horizon_h)) < dt / 2:
+            truth = {i + 1: page_rates[i] for i in range(n)}
+    at = t0 + timedelta(hours=checkpoint_h)
+    target = at + timedelta(minutes=6510)
+    case = {
+        "schema": "makefun/gta6-trophies-case/v1",
+        "id": "sim-rp",
+        "at": iso(at.timestamp()),
+        "horizon_minutes": 6510,
+        "target": iso(target.timestamp()),
+        "levels": LEVELS,
+        "game": {},
+        "trophies": [{"id": i + 1} for i in range(n)],
+        "history": history,
+        "notes": "simulated-refresh-process",
+    }
+    return case, truth
+
+
 def scenario_ensemble():
-    print("== (iii) scenario ensemble (24 simulated final-like cases)")
+    print("== (iii) scenario ensemble EXPANDED (48 cases: 24 Thursday smooth + 24 refresh-process)")
     base = load_case("p01")
     base_rates = base["history"][-1]["rates"]
     trophies = base["trophies"]
     totals = {name: [] for name in FORECASTERS}
+    totals_a = {name: [] for name in FORECASTERS}
+    totals_b = {name: [] for name in FORECASTERS}
     covs = []
+    covs_b = []
     idx = 0
     for p_max in (6000.0, 20000.0, 60000.0, 200000.0):
         for delta in (0.25, 0.5, 0.75):
@@ -291,18 +388,44 @@ def scenario_ensemble():
                 rng = random.Random(20261119 + idx)
                 idx += 1
                 case, truth = simulate_scenario(rng, base_rates, p_max, tau_p, delta)
-                # Truth ids in the sim are 1..55 in trophy order.
                 truth_by_id = {trophies[i]["id"]: truth[i + 1] for i in range(len(trophies))}
                 for name, fn in FORECASTERS.items():
-                    totals[name].append(pinball(fn(case), truth_by_id))
+                    v = pinball(fn(case), truth_by_id)
+                    totals[name].append(v)
+                    totals_a[name].append(v)
                 covs.append(coverage(fc_candidate(case), truth_by_id))
+    idx = 0
+    for jump_scale in (0.7, 1.3):
+        for cadence_h in (3.0, 7.0):
+            for delta in (0.25, 0.5, 0.75):
+                for big_jump in (False, True):
+                    rng = random.Random(20261121 + idx)
+                    p_max = (6000.0, 20000.0, 60000.0, 200000.0)[idx % 4]
+                    idx += 1
+                    case, truth = simulate_refresh_process(rng, base_rates, jump_scale, cadence_h, delta, big_jump, p_max)
+                    truth_by_id = {trophies[i]["id"]: truth[i + 1] for i in range(len(trophies))}
+                    for name, fn in FORECASTERS.items():
+                        v = pinball(fn(case), truth_by_id)
+                        totals[name].append(v)
+                        totals_b[name].append(v)
+                    c = coverage(fc_candidate(case), truth_by_id)
+                    covs.append(c)
+                    covs_b.append(c)
+    n_all = len(totals["candidate"])
     for name, vals in totals.items():
-        print(f"   {name}: mean pinball = {sum(vals) / len(vals):.4f}  (n={len(vals)})")
-    best_house = min(sum(totals["persistence"]) / 24, sum(totals["house_curve"]) / 24)
-    cand = sum(totals["candidate"]) / 24
+        print(f"   {name}: mean pinball = {sum(vals) / len(vals):.4f}  (n={n_all}; smooth {sum(totals_a[name]) / 24:.4f} / refresh {sum(totals_b[name]) / 24:.4f})")
+    best_house = min(sum(totals["persistence"]) / n_all, sum(totals["house_curve"]) / n_all)
+    cand = sum(totals["candidate"]) / n_all
+    thu = sum(totals["thursday"]) / n_all
     margin = (best_house - cand) / best_house * 100.0
+    margin_pers = (sum(totals["persistence"]) / n_all - cand) / (sum(totals["persistence"]) / n_all) * 100.0
+    vs_thu = (thu - cand) / thu * 100.0
+    cov = sum(covs) / len(covs)
+    cov_b = sum(covs_b) / len(covs_b)
     print(f"   candidate margin vs best house proxy: {margin:+.1f}%  (kill criterion: >= +10%)")
-    print(f"   candidate 5-95% band coverage: {sum(covs) / len(covs):.3f}  (target ~0.90)")
+    print(f"   candidate margin vs persistence (backtest gate WAJIB-1): {margin_pers:+.1f}%  (gate: >= +20%)")
+    print(f"   candidate vs Thursday model: {vs_thu:+.1f}%  (gate: > 0%)")
+    print(f"   candidate 5-95% band coverage: {cov:.3f} overall, {cov_b:.3f} refresh-process  (target 0.85-0.95)")
     return cand, best_house, margin
 
 
